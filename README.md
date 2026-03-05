@@ -24,7 +24,7 @@ jobs:
 
       - name: Detect affected packages
         id: affected
-        uses: robertrautenbach/rust-affected@v2.1.4
+        uses: robertrautenbach/rust-affected@v3.0.0
         with:
           force_triggers: |
             Cargo.lock
