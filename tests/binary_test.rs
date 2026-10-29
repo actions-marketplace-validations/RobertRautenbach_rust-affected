@@ -6,7 +6,7 @@ fn binary_path() -> PathBuf {
     // cargo test builds binaries into the same target directory
     let path = PathBuf::from(env!("CARGO_BIN_EXE_rust-affected"));
     // Ensure the binary exists (built by cargo test)
-    assert!(path.exists(), "Binary not found at {path:?}");
+    assert!(path.exists(), "Binary not found at {}", path.display());
     path
 }
 
@@ -21,6 +21,7 @@ fn run_binary(envs: &[(&str, &str)]) -> (String, bool) {
     cmd.current_dir(fixture_dir());
     // Clear env vars that could interfere
     cmd.env_remove("GITHUB_OUTPUT");
+    cmd.env_remove("GITHUB_STEP_SUMMARY");
     cmd.env_remove("CHANGED_FILES");
     cmd.env_remove("FORCE_TRIGGERS");
     cmd.env_remove("EXCLUDED_MEMBERS");
@@ -224,7 +225,8 @@ fn env_excluded_members_unset_means_no_exclusions() {
 
 #[test]
 fn env_github_output_writes_to_file() {
-    let tmp = std::env::temp_dir().join(format!("test-github-output-{}", std::process::id()));
+    let dir = tempfile::tempdir().unwrap();
+    let tmp = dir.path().join("output");
     // Create the file
     std::fs::write(&tmp, "").unwrap();
 
@@ -233,13 +235,8 @@ fn env_github_output_writes_to_file() {
         ("GITHUB_OUTPUT", tmp.to_str().unwrap()),
     ]);
     assert!(ok);
-    // stdout should be empty when GITHUB_OUTPUT is set
-    assert!(
-        stdout.trim().is_empty(),
-        "stdout should be empty when GITHUB_OUTPUT is set, got: {stdout}"
-    );
-
     let contents = std::fs::read_to_string(&tmp).unwrap();
+    assert_eq!(stdout, contents);
     assert!(contents.contains("changed_crates="));
     assert!(contents.contains("affected_library_members="));
     assert!(contents.contains("affected_binary_members="));
@@ -251,14 +248,12 @@ fn env_github_output_writes_to_file() {
             assert_eq!(parsed, vec!["app-alpha"]);
         }
     }
-
-    std::fs::remove_file(&tmp).ok();
 }
 
 #[test]
 fn env_github_output_appends_to_existing_content() {
-    let tmp =
-        std::env::temp_dir().join(format!("test-github-output-append-{}", std::process::id()));
+    let dir = tempfile::tempdir().unwrap();
+    let tmp = dir.path().join("output");
     std::fs::write(&tmp, "existing_key=existing_value\n").unwrap();
 
     let (_stdout, ok) = run_binary(&[
@@ -272,8 +267,6 @@ fn env_github_output_appends_to_existing_content() {
     assert!(contents.starts_with("existing_key=existing_value\n"));
     // New content appended
     assert!(contents.contains("changed_crates="));
-
-    std::fs::remove_file(&tmp).ok();
 }
 
 // ── JSON stdout output (no GITHUB_OUTPUT) ───────────────────────────

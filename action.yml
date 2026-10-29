@@ -11,7 +11,9 @@ inputs:
   changed_files:
     description: >
       Space- or newline-separated list of changed file paths relative to the
-      workspace root. Typically produced by a prior step such as
+      workspace root, including deletions and both paths of renames. Leading ./
+      and absolute paths beneath the workspace root are accepted. Filenames
+      containing whitespace are unsupported. Typically produced by a prior step such as
       `git diff --name-only`, `tj-actions/changed-files`, or
       `dorny/paths-filter`.
     required: true
@@ -32,7 +34,8 @@ inputs:
       name directly. An entry containing "/" is matched against the crate's
       directory relative to the workspace root: a trailing slash (e.g. "tools/")
       excludes every crate under that directory, while an exact relative path
-      (e.g. "tools/my-tool") excludes only that crate. Useful for internal
+      (e.g. "tools/my-tool") excludes that crate and members nested beneath it.
+      Leading ./ and redundant separators are accepted in path prefixes. Useful for internal
       tooling or helper crates that should never be deployed.
       If omitted, no members are excluded.
     required: false
@@ -41,15 +44,15 @@ outputs:
   changed_crates:
     description: JSON array of crates with directly changed files
   affected_library_members:
-    description: JSON array of all affected workspace members (including transitive dependents)
+    description: JSON array of affected pure library workspace members (no binary target), including transitive dependents
   affected_binary_members:
-    description: JSON array of affected deployable binaries (services)
+    description: JSON array of affected workspace members with a binary target, including transitive dependents
   force_all:
     description: Whether a force-trigger file changed
 
 runs:
   using: docker
-  image: 'docker://ghcr.io/robertrautenbach/rust-affected:v4.0.3'
+  image: 'docker://ghcr.io/robertrautenbach/rust-affected:v4.3.2@sha256:e1f788c53d317f7400bf829f9cab136dde771688b53ce67ab5e624fa1e7a71f0'
   env:
     CHANGED_FILES: ${{ inputs.changed_files }}
     FORCE_TRIGGERS: ${{ inputs.force_triggers }}

@@ -1,23 +1,45 @@
-use guppy::{MetadataCommand, graph::PackageGraph};
-use rust_affected::{AffectedResult, compute_affected};
+use rust_affected::AffectedResult;
+use rust_affected::WorkspaceGraph;
+use std::process::Command;
+
+fn compute_affected(
+    graph: &WorkspaceGraph,
+    files: &[String],
+    triggers: &[String],
+    excluded: &HashSet<String>,
+) -> AffectedResult {
+    rust_affected::compute_affected(graph, files, triggers, excluded).unwrap()
+}
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-fn fixture_graph() -> &'static PackageGraph {
-    static GRAPH: OnceLock<PackageGraph> = OnceLock::new();
+fn fixture_graph() -> &'static WorkspaceGraph {
+    static GRAPH: OnceLock<WorkspaceGraph> = OnceLock::new();
     GRAPH.get_or_init(|| {
         let fixture_dir: PathBuf = [env!("CARGO_MANIFEST_DIR"), "tests", "fixtures", "workspace"]
             .iter()
             .collect();
-        let mut cmd = MetadataCommand::new();
-        cmd.current_dir(&fixture_dir);
-        PackageGraph::from_command(&mut cmd).expect("Failed to load fixture package graph")
+        let output = Command::new(env!("CARGO"))
+            .args([
+                "metadata",
+                "--format-version",
+                "1",
+                "--all-features",
+                "--locked",
+                "--offline",
+            ])
+            .env("CARGO_CACHE_RUSTC_INFO", "0")
+            .current_dir(&fixture_dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        WorkspaceGraph::from_json(std::str::from_utf8(&output.stdout).unwrap()).unwrap()
     })
 }
 
 fn s(v: &[&str]) -> Vec<String> {
-    v.iter().map(|s| s.to_string()).collect()
+    v.iter().map(ToString::to_string).collect()
 }
 
 fn no_excludes() -> HashSet<String> {
@@ -25,7 +47,7 @@ fn no_excludes() -> HashSet<String> {
 }
 
 fn excludes(names: &[&str]) -> HashSet<String> {
-    names.iter().map(|s| s.to_string()).collect()
+    names.iter().map(ToString::to_string).collect()
 }
 
 // ── No changed files ────────────────────────────────────────────────
@@ -37,6 +59,7 @@ fn empty_changed_files_produces_empty_result() {
     assert_eq!(
         result,
         AffectedResult {
+            warnings: vec![],
             force_all: false,
             changed_crates: vec![],
             affected_library_members: vec![],
@@ -93,10 +116,7 @@ fn change_isolated_lib_only_affects_its_dependent() {
     let result = compute_affected(graph, &changed, &[], &no_excludes());
 
     assert_eq!(result.changed_crates, vec!["lib-standalone"]);
-    assert_eq!(
-        result.affected_library_members,
-        vec!["lib-standalone"]
-    );
+    assert_eq!(result.affected_library_members, vec!["lib-standalone"]);
     assert_eq!(result.affected_binary_members, vec!["app-beta"]);
 }
 
@@ -109,7 +129,7 @@ fn change_binary_only_affects_itself() {
     let result = compute_affected(graph, &changed, &[], &no_excludes());
 
     assert_eq!(result.changed_crates, vec!["app-alpha"]);
-    assert!(result.affected_library_members.is_empty());
+    assert_eq!(result.affected_library_members, Vec::<String>::new());
     assert_eq!(result.affected_binary_members, vec!["app-alpha"]);
 }
 
@@ -122,10 +142,7 @@ fn change_multiple_crates_unions_affected() {
     let result = compute_affected(graph, &changed, &[], &no_excludes());
 
     assert_eq!(result.changed_crates, vec!["app-alpha", "lib-standalone"]);
-    assert_eq!(
-        result.affected_library_members,
-        vec!["lib-standalone"]
-    );
+    assert_eq!(result.affected_library_members, vec!["lib-standalone"]);
     assert_eq!(
         result.affected_binary_members,
         vec!["app-alpha", "app-beta"]
@@ -261,7 +278,7 @@ fn excluded_changed_crate_removed_from_changed_list() {
     let excluded = excludes(&["lib-utils"]);
     let result = compute_affected(graph, &changed, &[], &excluded);
 
-    assert!(result.changed_crates.is_empty());
+    assert_eq!(result.changed_crates, Vec::<String>::new());
     assert!(
         !result
             .affected_library_members
@@ -277,9 +294,9 @@ fn file_outside_any_crate_produces_no_changes() {
     let changed = s(&["README.md"]);
     let result = compute_affected(graph, &changed, &[], &no_excludes());
 
-    assert!(result.changed_crates.is_empty());
-    assert!(result.affected_library_members.is_empty());
-    assert!(result.affected_binary_members.is_empty());
+    assert_eq!(result.changed_crates, Vec::<String>::new());
+    assert_eq!(result.affected_library_members, Vec::<String>::new());
+    assert_eq!(result.affected_binary_members, Vec::<String>::new());
 }
 
 // ── Force trigger with excluded members ─────────────────────────────
@@ -387,7 +404,7 @@ fn leaf_binary_does_not_pull_unrelated() {
     let result = compute_affected(graph, &changed, &[], &no_excludes());
 
     assert_eq!(result.changed_crates, vec!["app-alpha"]);
-    assert!(result.affected_library_members.is_empty());
+    assert_eq!(result.affected_library_members, Vec::<String>::new());
     assert_eq!(result.affected_binary_members, vec!["app-alpha"]);
     // Ensure unrelated crates are absent
     assert!(
@@ -570,7 +587,7 @@ fn path_prefix_no_false_positive() {
     assert!(!result.changed_crates.contains(&"lib-core".to_string()));
     // lib-core-ext has no reverse dependents, so affected is just itself
     assert_eq!(result.affected_library_members, vec!["lib-core-ext"]);
-    assert!(result.affected_binary_members.is_empty());
+    assert_eq!(result.affected_binary_members, Vec::<String>::new());
 }
 
 // ── Path-based exclusion ────────────────────────────────────────────
@@ -642,9 +659,9 @@ fn path_prefix_excludes_direct_change_in_nested_crate() {
     let excluded = excludes(&["tools/"]);
     let result = compute_affected(graph, &changed, &[], &excluded);
 
-    assert!(result.changed_crates.is_empty());
-    assert!(result.affected_library_members.is_empty());
-    assert!(result.affected_binary_members.is_empty());
+    assert_eq!(result.changed_crates, Vec::<String>::new());
+    assert_eq!(result.affected_library_members, Vec::<String>::new());
+    assert_eq!(result.affected_binary_members, Vec::<String>::new());
 }
 
 #[test]
@@ -674,7 +691,7 @@ fn nested_crate_detected_when_directly_changed() {
     let result = compute_affected(graph, &changed, &[], &no_excludes());
 
     assert_eq!(result.changed_crates, vec!["tool-alpha"]);
-    assert!(result.affected_library_members.is_empty());
+    assert_eq!(result.affected_library_members, Vec::<String>::new());
     assert_eq!(result.affected_binary_members, vec!["tool-alpha"]);
 }
 
@@ -690,7 +707,7 @@ fn library_with_tests_is_not_binary() {
     assert_eq!(result.affected_library_members, vec!["lib-with-tests"]);
     // lib-with-tests has integration tests but no main.rs — it must NOT
     // appear in affected_binary_members.
-    assert!(result.affected_binary_members.is_empty());
+    assert_eq!(result.affected_binary_members, Vec::<String>::new());
 }
 
 #[test]

@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM rust:1.96.1-slim-bookworm AS chef
+FROM --platform=$BUILDPLATFORM rust:1.98.1-slim-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
       musl-tools \
       gcc-aarch64-linux-gnu \
@@ -26,18 +26,27 @@ ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
 
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --target "$(cat /rust-target)" --recipe-path recipe.json
+RUN cargo chef cook --release --locked --target "$(cat /rust-target)" --recipe-path recipe.json
 
 COPY . .
 RUN TARGET="$(cat /rust-target)" && \
-    cargo build --release --target "$TARGET" -p rust-affected && \
+    cargo build --release --locked --target "$TARGET" -p rust-affected && \
     cp "target/$TARGET/release/rust-affected" /rust-affected
 
-FROM rust:1.96.1-alpine3.23
-RUN apk add --no-cache git
+# The binary shells out to `cargo metadata`, so the runtime image needs a Rust
+# toolchain. git stays too: when a consumer sets `net.git-fetch-with-cli = true`
+# cargo fetches git dependencies by spawning the git CLI (the smoke test covers
+# that configuration). This RUN executes on the target platform, so the release
+# build needs QEMU for the arm64 image.
+FROM rust:1.98.1-alpine3.23
+# Use the installed toolchain even when the checkout contains rust-toolchain.toml.
+# Derive the pin from the base image so dependency updates keep it in sync.
+ENV RUSTUP_TOOLCHAIN=${RUST_VERSION} RUSTUP_AUTO_INSTALL=0
+RUN test -n "${RUSTUP_TOOLCHAIN}" && rustup run "${RUSTUP_TOOLCHAIN}" cargo --version \
+    && apk add --no-cache git
 
 LABEL org.opencontainers.image.title="rust-affected"
-LABEL org.opencontainers.image.description="Detects changed files and computes affected Cargo workspace members via the dependency graph"
+LABEL org.opencontainers.image.description="Computes affected Cargo workspace members from a set of changed files via the Cargo dependency graph"
 LABEL org.opencontainers.image.source="https://github.com/robertrautenbach/rust-affected"
 LABEL org.opencontainers.image.licenses="MIT"
 LABEL org.opencontainers.image.authors="Robert Rautenbach"

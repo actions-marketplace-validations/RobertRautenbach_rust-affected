@@ -2,6 +2,11 @@
 name = "rust-affected"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.91"
+description = "Computes affected Cargo workspace members from a set of changed files via the Cargo dependency graph"
+license = "MIT"
+repository = "https://github.com/robertrautenbach/rust-affected"
+publish = false
 
 [lib]
 name = "rust_affected"
@@ -12,9 +17,15 @@ name = "rust-affected"
 path = "src/main.rs"
 
 [dependencies]
-guppy = "0.17.26"
+guppy = "0.19.1"
 globset = "0.4"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+path-clean = "1.0.1"
+cargo_metadata = "0.23.1"
+
+[lints.clippy]
+pedantic = "warn"
 
 [profile.release]
 opt-level = "z"
@@ -22,3 +33,6 @@ strip = true
 lto = true
 codegen-units = 1
 panic = "abort"
+
+[dev-dependencies]
+tempfile = "3"
