@@ -1,6 +1,6 @@
 name: rust-affected
 description: >
-  Computes affected Cargo workspace members from a set of changed files
+  Computes affected Cargo workspace packages from a set of changed files
   via the Cargo dependency graph.
 author: Robert Rautenbach
 branding:
@@ -8,14 +8,16 @@ branding:
   color: orange
 
 inputs:
-  changed_files:
+  changed_files_json:
     description: >
-      Space- or newline-separated list of changed file paths relative to the
-      workspace root, including deletions and both paths of renames. Leading ./
-      and absolute paths beneath the workspace root are accepted. Filenames
-      containing whitespace are unsupported. Typically produced by a prior step such as
-      `git diff --name-only`, `tj-actions/changed-files`, or
-      `dorny/paths-filter`.
+      JSON array of changed file paths relative to the workspace root, such as
+      ["src/lib.rs","docs/my file.md"], including deletions and both paths of
+      renames. Use [] when nothing changed; a missing or blank value fails the
+      action. Each element is one exact path: nothing is split or unquoted, so
+      any filename is supported. Leading ./ and absolute paths beneath the
+      workspace root are accepted. Typically produced by
+      `tj-actions/changed-files` with `json: true` or `dorny/paths-filter`
+      with `list-files: json`.
     required: true
   force_triggers:
     description: >
@@ -24,36 +26,46 @@ inputs:
       A bare name (e.g. "Cargo.lock") matches that exact path only.
       A trailing slash (e.g. "infra/") matches the directory and everything inside it.
       Full glob patterns are also supported (e.g. "**/*.sql", ".github/**").
+      Patterns are relative to the workspace root; an empty or absolute pattern,
+      or one containing "..", can never match and fails the action.
       If omitted, no force triggers are applied.
     required: false
-  excluded_members:
+  excluded_packages:
     description: >
-      Space- or newline-separated list of workspace member names or path prefixes
-      to exclude from all outputs (changed_crates, affected_library_members,
-      affected_binary_members). A plain name (e.g. "my-tool") matches the crate
-      name directly. An entry containing "/" is matched against the crate's
+      Space- or newline-separated list of workspace package names or path prefixes
+      to exclude from all outputs (changed_packages, affected_libraries,
+      affected_binaries). A plain name (e.g. "my-tool") matches the package
+      name directly. An entry containing "/" is matched against the package's
       directory relative to the workspace root: a trailing slash (e.g. "tools/")
-      excludes every crate under that directory, while an exact relative path
-      (e.g. "tools/my-tool") excludes that crate and members nested beneath it.
+      excludes every package under that directory, while an exact relative path
+      (e.g. "tools/my-tool") excludes that package and packages nested beneath it.
       Leading ./ and redundant separators are accepted in path prefixes. Useful for internal
-      tooling or helper crates that should never be deployed.
-      If omitted, no members are excluded.
+      tooling or helper packages that should never be deployed.
+      If omitted, no packages are excluded.
     required: false
+  trust_cargo_config:
+    description: >
+      Set to "true" to let Cargo read the repository's .cargo/config.toml. By
+      default ("false") Cargo runs from outside the checkout and does not read
+      it, because a pull request can use it to make Cargo run arbitrary
+      programs during detection. Set it only where the checkout is trusted,
+      when the workspace depends on settings that exist only in that
+      configuration, such as [patch] entries, vendored sources, private
+      registries or net.git-fetch-with-cli. A rust-toolchain file is never
+      used: the action runs its own pinned toolchain.
+    required: false
+    default: 'false'
 
 outputs:
-  changed_crates:
-    description: JSON array of crates with directly changed files
-  affected_library_members:
-    description: JSON array of affected pure library workspace members (no binary target), including transitive dependents
-  affected_binary_members:
-    description: JSON array of affected workspace members with a binary target, including transitive dependents
+  changed_packages:
+    description: JSON array of packages with directly changed files
+  affected_libraries:
+    description: JSON array of affected workspace packages without a binary target, including transitive dependents
+  affected_binaries:
+    description: JSON array of affected workspace packages with a binary target, including transitive dependents. A package with both a library and a binary appears only here
   force_all:
     description: Whether a force-trigger file changed
 
 runs:
   using: docker
-  image: 'docker://ghcr.io/robertrautenbach/rust-affected:v4.3.2@sha256:e1f788c53d317f7400bf829f9cab136dde771688b53ce67ab5e624fa1e7a71f0'
-  env:
-    CHANGED_FILES: ${{ inputs.changed_files }}
-    FORCE_TRIGGERS: ${{ inputs.force_triggers }}
-    EXCLUDED_MEMBERS: ${{ inputs.excluded_members }}
+  image: 'docker://ghcr.io/robertrautenbach/rust-affected:v5.0.2@sha256:e9e88baa212b0e91a680828904166f75eeed1592cae2ad7f1b4a98e33c680eb0'

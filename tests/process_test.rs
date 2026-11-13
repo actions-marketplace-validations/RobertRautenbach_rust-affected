@@ -23,6 +23,11 @@ fn workspace() -> TempDir {
     scratch
 }
 
+/// The JSON array for a whitespace-separated list of paths.
+fn json(files: &str) -> String {
+    serde_json::to_string(&files.split_whitespace().collect::<Vec<_>>()).unwrap()
+}
+
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workspace")
 }
@@ -33,9 +38,19 @@ fn command(cwd: &Path) -> Command {
     for key in [
         "GITHUB_OUTPUT",
         "GITHUB_STEP_SUMMARY",
-        "CHANGED_FILES",
+        "GITHUB_WORKSPACE",
+        "CHANGED_FILES_JSON",
         "FORCE_TRIGGERS",
-        "EXCLUDED_MEMBERS",
+        "EXCLUDED_PACKAGES",
+        "IGNORE_CARGO_CONFIG",
+        "TRUST_CARGO_CONFIG",
+        "INPUT_CHANGED_FILES_JSON",
+        "INPUT_FORCE_TRIGGERS",
+        "INPUT_EXCLUDED_PACKAGES",
+        "INPUT_TRUST_CARGO_CONFIG",
+        "INPUT_CHANGED_FILES",
+        "INPUT_EXCLUDED_MEMBERS",
+        "INPUT_IGNORE_CARGO_CONFIG",
     ] {
         cmd.env_remove(key);
     }
@@ -69,7 +84,7 @@ fn missing_workspace_fails_even_without_changes() {
     let scratch = tempfile::tempdir().unwrap();
     for changed in ["x", ""] {
         assert_error(
-            &run(scratch.path(), &[("CHANGED_FILES", changed)]),
+            &run(scratch.path(), &[("CHANGED_FILES_JSON", &json(changed))]),
             "could not find",
         );
     }
@@ -109,9 +124,9 @@ fn external_targets_warn_without_changing_attribution() {
             let output = run(
                 scratch.path(),
                 &[
-                    ("CHANGED_FILES", changed),
+                    ("CHANGED_FILES_JSON", &json(changed)),
                     ("FORCE_TRIGGERS", trigger),
-                    ("EXCLUDED_MEMBERS", excluded),
+                    ("EXCLUDED_PACKAGES", excluded),
                 ],
             );
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -131,9 +146,9 @@ fn external_targets_warn_without_changing_attribution() {
             assert_eq!(
                 result,
                 serde_json::json!({
-                    "changed_crates": [],
-                    "affected_library_members": [],
-                    "affected_binary_members": [],
+                    "changed_packages": [],
+                    "affected_libraries": [],
+                    "affected_binaries": [],
                     "force_all": !trigger.is_empty(),
                 })
             );
@@ -147,7 +162,10 @@ fn invalid_glob_fails_even_without_changes() {
         assert_error(
             &run(
                 &fixture(),
-                &[("CHANGED_FILES", changed), ("FORCE_TRIGGERS", "[abc")],
+                &[
+                    ("CHANGED_FILES_JSON", &json(changed)),
+                    ("FORCE_TRIGGERS", "[abc"),
+                ],
             ),
             "invalid force_triggers pattern",
         );
@@ -155,20 +173,603 @@ fn invalid_glob_fails_even_without_changes() {
 }
 
 #[test]
-fn warnings_are_grouped_and_do_not_pollute_json() {
-    for (envs, messages) in [
-        (vec![], vec!["changed_files is empty"]),
-        (
-            vec![
-                ("CHANGED_FILES", "../x ../x /outside/file"),
-                ("FORCE_TRIGGERS", "**"),
-                ("EXCLUDED_MEMBERS", "tools unknown"),
+fn unmatchable_trigger_fails_even_without_changes() {
+    for changed in ["lib-core/src/lib.rs", ""] {
+        for trigger in ["/Cargo.lock", "./", "infra/../infra/"] {
+            assert_error(
+                &run(
+                    &fixture(),
+                    &[
+                        ("CHANGED_FILES_JSON", &json(changed)),
+                        ("FORCE_TRIGGERS", trigger),
+                    ],
+                ),
+                "can never match",
+            );
+        }
+    }
+}
+
+const MEMBER_LOCK: &str = "version = 4\n\n[[package]]\nname = \"member\"\nversion = \"0.1.0\"\n";
+const MEMBER_OUTPUT: &str = "{\"affected_binaries\":[],\"affected_libraries\":[\"member\"],\"changed_packages\":[\"member\"],\"force_all\":false}\n";
+
+const CHANGED_MEMBER: (&str, &str) = ("CHANGED_FILES_JSON", r#"["member/src/lib.rs"]"#);
+
+/// A locked workspace whose `.cargo/config.toml` makes Cargo run a program
+/// that leaves a marker. Returns the workspace and the marker's path.
+#[cfg(unix)]
+fn workspace_with_planted_program() -> (TempDir, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = workspace();
+    std::fs::write(scratch.path().join("Cargo.lock"), MEMBER_LOCK).unwrap();
+    let marker = scratch.path().join("executed");
+    let program = scratch.path().join("rustc.sh");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\necho ran >> '{}'\nexec rustc \"$@\"\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir(scratch.path().join(".cargo")).unwrap();
+    std::fs::write(
+        scratch.path().join(".cargo/config.toml"),
+        format!("[build]\nrustc = '{}'\n", program.display()),
+    )
+    .unwrap();
+    (scratch, marker)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_job_variable_cannot_replace_an_input() {
+    // The runner sets INPUT_<NAME> for every declared input, so a variable the
+    // job happens to define under the bare name must not be read instead.
+    let (scratch, marker) = workspace_with_planted_program();
+    for input in ["false", ""] {
+        let output = command(scratch.path())
+            .envs([
+                CHANGED_MEMBER,
+                ("INPUT_TRUST_CARGO_CONFIG", input),
+                ("TRUST_CARGO_CONFIG", "true"),
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), MEMBER_OUTPUT);
+        assert!(!marker.exists(), "program ran with input {input:?}");
+    }
+    // An input left empty stays empty.
+    let changed = ("INPUT_CHANGED_FILES_JSON", r#"["lib-utils/src/lib.rs"]"#);
+    let output = run(
+        &fixture(),
+        &[
+            changed,
+            ("INPUT_EXCLUDED_PACKAGES", ""),
+            ("EXCLUDED_PACKAGES", "tools/"),
+            ("INPUT_FORCE_TRIGGERS", ""),
+            ("FORCE_TRIGGERS", "**"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["force_all"], false);
+    assert_eq!(
+        json["affected_binaries"],
+        serde_json::json!(["app-alpha", "app-beta", "tool-alpha"])
+    );
+    assert_error(
+        &run(
+            &fixture(),
+            &[
+                ("INPUT_CHANGED_FILES_JSON", ""),
+                ("CHANGED_FILES_JSON", r#"["lib-utils/src/lib.rs"]"#),
             ],
-            vec!["changed file", "excluded_members"],
+        ),
+        "changed_files_json is required",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cargo_home_inside_an_untrusted_checkout_is_refused() {
+    // Cargo reads $CARGO_HOME/config.toml wherever it starts.
+    let (scratch, marker) = workspace_with_planted_program();
+    let home = scratch.path().join(".cargo");
+    let home = home.to_str().unwrap();
+    let message = "is inside the checkout, so Cargo would read configuration from the repository although trust_cargo_config is false";
+    for directory in ["", "member"] {
+        let output = command(&scratch.path().join(directory))
+            .envs([CHANGED_MEMBER, ("CARGO_HOME", home)])
+            .output()
+            .unwrap();
+        assert_error(&output, message);
+        assert!(!marker.exists(), "program ran from {directory:?}");
+    }
+    // A home that does not exist yet is refused too: the pull request could add it.
+    let absent = scratch.path().join("member/absent-home");
+    assert_error(
+        &run(
+            scratch.path(),
+            &[CHANGED_MEMBER, ("CARGO_HOME", absent.to_str().unwrap())],
+        ),
+        message,
+    );
+    // GITHUB_WORKSPACE names the checkout even when no manifest sits at its top.
+    let outer = tempfile::tempdir().unwrap();
+    let inner = outer.path().join("crates");
+    std::fs::create_dir_all(inner.join("src")).unwrap();
+    std::fs::write(
+        inner.join("Cargo.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(inner.join("src/lib.rs"), "").unwrap();
+    let sibling = outer.path().join("cargo-home");
+    let envs = [
+        ("CHANGED_FILES_JSON", r#"["src/lib.rs"]"#),
+        ("CARGO_HOME", sibling.to_str().unwrap()),
+    ];
+    assert!(run(&inner, &envs).status.success());
+    let output = command(&inner)
+        .envs(envs)
+        .env("GITHUB_WORKSPACE", outer.path())
+        .output()
+        .unwrap();
+    assert_error(&output, message);
+    // Trusted, the checkout's configuration is meant to be read.
+    let output = command(scratch.path())
+        .envs([
+            CHANGED_MEMBER,
+            ("CARGO_HOME", home),
+            ("TRUST_CARGO_CONFIG", "true"),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(marker.exists());
+}
+
+/// The toolchain's own `rustc`, next to the `cargo` running these tests.
+///
+/// A run that gets past the guard with a relocated `RUSTUP_HOME` would
+/// otherwise reach `rustc` through the rustup proxy, which looks for the
+/// toolchain in that home and may try to download it.
+fn toolchain_rustc() -> PathBuf {
+    Path::new(env!("CARGO")).with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX))
+}
+
+#[test]
+fn rustup_home_inside_an_untrusted_checkout_is_refused() {
+    // rustup runs cargo and rustc from $RUSTUP_HOME/toolchains wherever it starts.
+    let scratch = workspace();
+    std::fs::write(scratch.path().join("Cargo.lock"), MEMBER_LOCK).unwrap();
+    let message = "is inside the checkout, so rustup would run a toolchain from the repository although trust_cargo_config is false";
+    // The home need not exist yet: the pull request could add it.
+    let home = scratch.path().join(".rustup");
+    let home = home.to_str().unwrap();
+    for directory in ["", "member"] {
+        let output = run(
+            &scratch.path().join(directory),
+            &[CHANGED_MEMBER, ("RUSTUP_HOME", home)],
+        );
+        assert_error(&output, message);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("::error::RUSTUP_HOME ("));
+    }
+    // An acceptable CARGO_HOME does not end the check before RUSTUP_HOME is looked at.
+    let outside = tempfile::tempdir().unwrap();
+    let outside = outside.path().to_str().unwrap();
+    assert_error(
+        &run(
+            scratch.path(),
+            &[
+                CHANGED_MEMBER,
+                ("CARGO_HOME", outside),
+                ("RUSTUP_HOME", home),
+            ],
+        ),
+        message,
+    );
+    // Past the guard, Cargo is given rustc directly so that rustup is never consulted.
+    let rustc = toolchain_rustc();
+    let passing = |envs: &[(&str, &str)]| {
+        let output = command(scratch.path())
+            .envs([CHANGED_MEMBER, ("RUSTUP_AUTO_INSTALL", "0")])
+            .env("RUSTC", &rustc)
+            .envs(envs.iter().copied())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{envs:?}: {stderr}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), MEMBER_OUTPUT);
+    };
+    // A home outside the checkout is the job's own business.
+    passing(&[("RUSTUP_HOME", outside)]);
+    // Trusted, the checkout may supply whatever it likes.
+    passing(&[("RUSTUP_HOME", home), ("TRUST_CARGO_CONFIG", "true")]);
+    // GITHUB_WORKSPACE names the checkout even when no manifest sits at its top.
+    let outer = tempfile::tempdir().unwrap();
+    let inner = outer.path().join("crates");
+    std::fs::create_dir_all(inner.join("src")).unwrap();
+    std::fs::write(
+        inner.join("Cargo.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(inner.join("src/lib.rs"), "").unwrap();
+    let sibling = outer.path().join("rustup-home");
+    let output = command(&inner)
+        .envs([
+            ("CHANGED_FILES_JSON", r#"["src/lib.rs"]"#),
+            ("RUSTUP_HOME", sibling.to_str().unwrap()),
+        ])
+        .env("GITHUB_WORKSPACE", outer.path())
+        .output()
+        .unwrap();
+    assert_error(&output, message);
+}
+
+#[cfg(unix)]
+#[test]
+fn repository_cargo_config_is_read_only_when_trusted() {
+    let (scratch, marker) = workspace_with_planted_program();
+    // Untrusted unless stated: the configured program never runs, from the root
+    // or from a member. The switch removed in v5 cannot turn the isolation off.
+    for (directory, extra) in [
+        ("", None),
+        ("member", None),
+        ("", Some(("TRUST_CARGO_CONFIG", "false"))),
+        ("", Some(("IGNORE_CARGO_CONFIG", "false"))),
+    ] {
+        let output = command(&scratch.path().join(directory))
+            .envs([CHANGED_MEMBER])
+            .envs(extra)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(stderr, "", "{directory:?} {extra:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), MEMBER_OUTPUT);
+        assert!(!marker.exists(), "program ran: {directory:?} {extra:?}");
+    }
+    // Trusted: Cargo honours the checkout's configuration and runs the program.
+    command(scratch.path())
+        .envs([CHANGED_MEMBER, ("TRUST_CARGO_CONFIG", "true")])
+        .output()
+        .unwrap();
+    assert!(marker.exists());
+    assert_eq!(
+        std::fs::read_to_string(scratch.path().join("Cargo.lock")).unwrap(),
+        MEMBER_LOCK
+    );
+}
+
+#[test]
+fn a_cargo_failure_names_the_unread_repository_config() {
+    let patched = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/patch-config");
+    let changed = ("CHANGED_FILES_JSON", r#"["core/src/lib.rs"]"#);
+    let trusted = run(&patched, &[changed, ("TRUST_CARGO_CONFIG", "true")]);
+    assert!(trusted.status.success());
+    assert_eq!(String::from_utf8_lossy(&trusted.stderr), "");
+    // The [patch] lives only in .cargo/config.toml; without it the lock is stale.
+    let output = run(&patched, &[changed]);
+    assert_error(&output, "cargo metadata failed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            ".cargo/config.toml was not read because trust_cargo_config is false; set trust_cargo_config: true if this checkout is trusted and Cargo needs that configuration."
+        ),
+        "{stderr}"
+    );
+    // With no configuration to blame, the failure is reported as it is.
+    let scratch = workspace();
+    std::fs::write(scratch.path().join("Cargo.lock"), "version = 4\n").unwrap();
+    let output = run(scratch.path(), &[CHANGED_MEMBER]);
+    assert_error(&output, "cargo metadata failed");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("trust_cargo_config"));
+}
+
+#[test]
+fn an_unread_repository_config_without_a_lock_is_warned_about() {
+    // Without a lock, ignoring a [patch] or source replacement changes the
+    // resolved graph instead of failing, so the unread file must be named.
+    let lock_warning = "::warning::No Cargo.lock in the workspace root;";
+    let config_warning = "is not read because trust_cargo_config is false, and without a Cargo.lock a [patch] or source replacement defined there is silently not applied. Set trust_cargo_config: true if this checkout is trusted.";
+    for (config, directory) in [
+        (".cargo/config.toml", ""),
+        (".cargo/config", ""),
+        ("member/.cargo/config.toml", "member"),
+        (".cargo/config.toml", "member"),
+    ] {
+        let scratch = workspace();
+        let config_path = scratch.path().join(config);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "[net]\nretry = 1\n").unwrap();
+        let cwd = scratch.path().join(directory);
+        let lock = scratch.path().join("Cargo.lock");
+
+        let output = run(&cwd, &[CHANGED_MEMBER]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        let lines: Vec<_> = stderr.lines().collect();
+        assert_eq!(lines.len(), 2, "{stderr}");
+        assert!(lines[0].starts_with(lock_warning), "{stderr}");
+        assert!(
+            lines[1].starts_with("::warning::")
+                && lines[1].contains(config)
+                && lines[1].ends_with(config_warning),
+            "{stderr}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), MEMBER_OUTPUT);
+
+        // Trusted, the file is read, so only the missing lock is reported.
+        std::fs::remove_file(&lock).unwrap();
+        let output = run(&cwd, &[CHANGED_MEMBER, ("TRUST_CARGO_CONFIG", "true")]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        assert!(stderr.starts_with(lock_warning), "{stderr}");
+
+        // With a lock, a difference in resolution fails instead: nothing to say.
+        let output = run(&cwd, &[CHANGED_MEMBER]);
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), MEMBER_OUTPUT);
+    }
+    // A configuration file outside the workspace is not the repository's.
+    let outer = tempfile::tempdir().unwrap();
+    std::fs::create_dir(outer.path().join(".cargo")).unwrap();
+    std::fs::write(outer.path().join(".cargo/config.toml"), "").unwrap();
+    let inner = outer.path().join("checkout");
+    std::fs::create_dir_all(inner.join("src")).unwrap();
+    std::fs::write(
+        inner.join("Cargo.toml"),
+        "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(inner.join("src/lib.rs"), "").unwrap();
+    let output = run(&inner, &[("CHANGED_FILES_JSON", r#"["src/lib.rs"]"#)]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.starts_with(lock_warning), "{stderr}");
+}
+
+#[test]
+fn trust_cargo_config_requires_a_boolean_and_isolation_a_manifest() {
+    for value in ["1", "yes", "TRUE", "True", " true"] {
+        assert_error(
+            &run(
+                &fixture(),
+                &[
+                    ("CHANGED_FILES_JSON", r#"["lib-core/src/lib.rs"]"#),
+                    ("TRUST_CARGO_CONFIG", value),
+                ],
+            ),
+            "TRUST_CARGO_CONFIG must be 'true' or 'false'",
+        );
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    assert_error(
+        &run(scratch.path(), &[("CHANGED_FILES_JSON", r#"["x"]"#)]),
+        "could not find Cargo.toml in the working directory or any parent directory",
+    );
+}
+
+#[test]
+fn uncovered_workspace_files_warn_without_changing_results() {
+    let output = run(
+        &fixture(),
+        &[(
+            "CHANGED_FILES_JSON",
+            r#"["Cargo.lock","./Cargo.toml","README.md"]"#,
+        )],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.starts_with("::warning::workspace-wide files changed but belong to no package and matched no force trigger, so nothing was selected for them: [\"Cargo.lock\", \"Cargo.toml\"]."),
+        "{stderr}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "{\"affected_binaries\":[],\"affected_libraries\":[],\"changed_packages\":[],\"force_all\":false}\n"
+    );
+}
+
+#[test]
+fn json_paths_are_exact_strings() {
+    let scratch = workspace();
+    std::fs::write(scratch.path().join("Cargo.lock"), MEMBER_LOCK).unwrap();
+    // Nothing is split, trimmed or decoded: each element is one path.
+    for files in [
+        r#"["member/src/lib.rs"]"#,
+        r#"["member/src/my file.rs"]"#,
+        r#"["member/src/café.rs"]"#,
+        r#"["member/src/café.rs"]"#,
+        r#"["member/src/a\"b.rs"]"#,
+        r#"["member/src/a\\b.rs"]"#,
+        r#"["member/src/tab\there.rs", "member/src/line\nbreak.rs"]"#,
+        "  [\n  \"member/src/lib.rs\" ,\n  \"member/Cargo.toml\"\n]\n",
+        r#"["README.md", "member/src/lib.rs", "member/src/lib.rs"]"#,
+    ] {
+        let output = run(scratch.path(), &[("CHANGED_FILES_JSON", files)]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{files}: {stderr}");
+        assert_eq!(stderr, "", "{files}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            MEMBER_OUTPUT,
+            "{files}"
+        );
+    }
+    // Neither is it split or unquoted: a space keeps "member/src/lib.rs" inside
+    // an unowned directory, and git's quoted form is a different, unowned path.
+    let output = run(
+        scratch.path(),
+        &[(
+            "CHANGED_FILES_JSON",
+            r#"["docs/notes member/src/lib.rs", "\"member/src/caf\\303\\251.rs\"", "\"member/src/lib.rs\""]"#,
+        )],
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "{\"affected_binaries\":[],\"affected_libraries\":[],\"changed_packages\":[],\"force_all\":false}\n"
+    );
+}
+
+#[test]
+fn changed_files_json_is_required_and_must_be_an_array_of_strings() {
+    let scratch = workspace();
+    std::fs::write(scratch.path().join("Cargo.lock"), MEMBER_LOCK).unwrap();
+    for envs in [
+        vec![],
+        vec![("CHANGED_FILES_JSON", "")],
+        vec![("CHANGED_FILES_JSON", " \n\t")],
+        // The input removed in v5 is not read.
+        vec![("CHANGED_FILES", "member/src/lib.rs")],
+    ] {
+        assert_error(
+            &run(scratch.path(), &envs),
+            "changed_files_json is required: pass a JSON array of paths, or [] when nothing changed",
+        );
+    }
+    for value in [
+        "member/src/lib.rs",
+        "member/src/lib.rs member/Cargo.toml",
+        r#""member/src/lib.rs""#,
+        r#"{"files":["member/src/lib.rs"]}"#,
+        r#"["member/src/lib.rs", 1]"#,
+        r#"[["member/src/lib.rs"]]"#,
+        "[null]",
+        "null",
+        r#"["member/src/lib.rs"] ["member/Cargo.toml"]"#,
+        r#"["member/src/lib.rs""#,
+        r#"[\"member/src/lib.rs\"]"#,
+    ] {
+        assert_error(
+            &run(scratch.path(), &[("CHANGED_FILES_JSON", value)]),
+            "changed_files_json must be a JSON array of strings",
+        );
+    }
+}
+
+#[test]
+fn an_empty_array_is_valid_and_still_warns() {
+    for value in ["[]", " [ ] "] {
+        let output = run(&fixture(), &[("CHANGED_FILES_JSON", value)]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        assert!(
+            stderr.starts_with("::warning::changed_files_json is empty;"),
+            "{stderr}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "{\"affected_binaries\":[],\"affected_libraries\":[],\"changed_packages\":[],\"force_all\":false}\n"
+        );
+    }
+}
+
+#[test]
+fn inputs_removed_in_v5_fail_instead_of_being_ignored() {
+    // The runner hands every `with:` key to the container as INPUT_<NAME>,
+    // including ones action.yml no longer declares.
+    let changed = ("CHANGED_FILES_JSON", r#"["lib-core/src/lib.rs"]"#);
+    for (variable, advice) in [
+        (
+            "INPUT_CHANGED_FILES",
+            "changed_files (use changed_files_json, a JSON array of paths)",
         ),
         (
-            vec![("EXCLUDED_MEMBERS", "tools")],
-            vec!["changed_files is empty", "excluded_members"],
+            "INPUT_EXCLUDED_MEMBERS",
+            "excluded_members (renamed to excluded_packages)",
+        ),
+        (
+            "INPUT_IGNORE_CARGO_CONFIG",
+            "ignore_cargo_config (Cargo configuration is now unread unless trust_cargo_config is true)",
+        ),
+    ] {
+        for value in ["lib-utils", "false"] {
+            let output = run(&fixture(), &[changed, (variable, value)]);
+            assert_error(&output, "inputs removed in v5 were passed: ");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(advice), "{stderr}");
+            assert!(
+                stderr.contains("See \"Migrating from v4\" in the README."),
+                "{stderr}"
+            );
+        }
+    }
+    // Every removed input that was passed is named, in one error, before anything else is read.
+    let output = run(
+        &fixture(),
+        &[
+            ("INPUT_EXCLUDED_MEMBERS", "tools/"),
+            ("INPUT_CHANGED_FILES", "lib-core/src/lib.rs"),
+            ("FORCE_TRIGGERS", "[abc"),
+        ],
+    );
+    assert_error(
+        &output,
+        "inputs removed in v5 were passed: changed_files (use changed_files_json, a JSON array of paths); excluded_members (renamed to excluded_packages). See",
+    );
+    // A blank value sets nothing, so it is not worth failing over, and the
+    // current inputs' own INPUT_ variables are not mistaken for removed ones.
+    let output = run(
+        &fixture(),
+        &[
+            changed,
+            ("INPUT_CHANGED_FILES", ""),
+            ("INPUT_EXCLUDED_MEMBERS", " \n"),
+            ("INPUT_IGNORE_CARGO_CONFIG", ""),
+            ("INPUT_CHANGED_FILES_JSON", r#"["lib-core/src/lib.rs"]"#),
+            ("INPUT_EXCLUDED_PACKAGES", "tools/"),
+            ("INPUT_TRUST_CARGO_CONFIG", "false"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stderr, "");
+    // What the runner really sets for a migrated workflow: names that merely
+    // begin like a removed one, and nothing else.
+    let output = run(
+        &fixture(),
+        &[
+            changed,
+            ("INPUT_CHANGED_FILES_JSON", r#"["lib-core/src/lib.rs"]"#),
+            ("INPUT_EXCLUDED_PACKAGES", "tools/"),
+            ("INPUT_TRUST_CARGO_CONFIG", "false"),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stderr, "");
+}
+
+#[test]
+fn warnings_are_grouped_and_do_not_pollute_json() {
+    for (envs, messages) in [
+        (
+            vec![("CHANGED_FILES_JSON", "[]")],
+            vec!["changed_files_json is empty"],
+        ),
+        (
+            vec![
+                ("CHANGED_FILES_JSON", r#"["../x","../x","/outside/file"]"#),
+                ("FORCE_TRIGGERS", "**"),
+                ("EXCLUDED_PACKAGES", "tools unknown"),
+            ],
+            vec!["changed file", "excluded_packages"],
+        ),
+        (
+            vec![("CHANGED_FILES_JSON", "[]"), ("EXCLUDED_PACKAGES", "tools")],
+            vec!["changed_files_json is empty", "excluded_packages"],
         ),
     ] {
         let output = run(&fixture(), &envs);
@@ -187,7 +788,7 @@ fn warnings_are_grouped_and_do_not_pollute_json() {
         }
         let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(json["force_all"], false);
-        assert_eq!(json["changed_crates"], serde_json::json!([]));
+        assert_eq!(json["changed_packages"], serde_json::json!([]));
     }
 }
 
@@ -195,10 +796,10 @@ fn warnings_are_grouped_and_do_not_pollute_json() {
 #[test]
 fn every_input_rejects_invalid_utf8_even_without_changes() {
     use std::os::unix::ffi::OsStrExt;
-    for key in ["CHANGED_FILES", "FORCE_TRIGGERS", "EXCLUDED_MEMBERS"] {
+    for key in ["CHANGED_FILES_JSON", "FORCE_TRIGGERS", "EXCLUDED_PACKAGES"] {
         for changed in ["", "lib-core/src/lib.rs"] {
             let output = command(&fixture())
-                .env("CHANGED_FILES", changed)
+                .env("CHANGED_FILES_JSON", json(changed))
                 .env(key, OsStr::from_bytes(b"\xff"))
                 .output()
                 .unwrap();
@@ -212,7 +813,7 @@ fn output_destination_failures_are_errors() {
     let scratch = tempfile::tempdir().unwrap();
     for key in ["GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY"] {
         let output = command(&fixture())
-            .env("CHANGED_FILES", "lib-core/src/lib.rs")
+            .env("CHANGED_FILES_JSON", r#"["lib-core/src/lib.rs"]"#)
             .env(key, scratch.path())
             .output()
             .unwrap();
@@ -228,7 +829,7 @@ fn metadata_preserves_existing_compiler_cache() {
     let original = b"{\"rustc_fingerprint\":0,\"outputs\":{},\"successes\":{}}";
     std::fs::write(&cache, original).unwrap();
     let output = command(scratch.path())
-        .env("CHANGED_FILES", "member/src/lib.rs")
+        .env("CHANGED_FILES_JSON", r#"["member/src/lib.rs"]"#)
         .env("CARGO_TARGET_DIR", scratch.path().join("target"))
         .env("CARGO_CACHE_RUSTC_INFO", "1")
         .output()
@@ -250,7 +851,7 @@ fn stale_locks_fail_without_rewriting_from_root_or_member() {
             std::fs::write(&lock, "version = 4\n").unwrap();
             let output = run(
                 &scratch.path().join(directory),
-                &[("CHANGED_FILES", changed)],
+                &[("CHANGED_FILES_JSON", &json(changed))],
             );
             assert_error(&output, "lock file");
             assert_eq!(std::fs::read_to_string(lock).unwrap(), "version = 4\n");
@@ -265,7 +866,7 @@ fn missing_locks_warn_and_are_created_even_without_changes() {
             let scratch = workspace();
             let output = run(
                 &scratch.path().join(directory),
-                &[("CHANGED_FILES", changed)],
+                &[("CHANGED_FILES_JSON", &json(changed))],
             );
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(output.status.success(), "{stderr}");
@@ -292,7 +893,7 @@ fn valid_locks_are_preserved_without_a_missing_lock_warning() {
     for directory in ["", "member"] {
         let output = run(
             &scratch.path().join(directory),
-            &[("CHANGED_FILES", "member/src/lib.rs")],
+            &[("CHANGED_FILES_JSON", r#"["member/src/lib.rs"]"#)],
         );
         assert!(
             output.status.success(),
@@ -312,7 +913,7 @@ fn cargo_errors_are_summarized_without_color_and_outputs_are_untouched() {
     std::fs::write(&output_path, "sentinel\n").unwrap();
     std::fs::write(&summary_path, "sentinel\n").unwrap();
     let output = command(scratch.path())
-        .env("CHANGED_FILES", "x")
+        .env("CHANGED_FILES_JSON", r#"["x"]"#)
         .env("CARGO_TERM_COLOR", "always")
         .env("RUSTUP_TERM_COLOR", "always")
         .env("GITHUB_OUTPUT", &output_path)
@@ -346,8 +947,10 @@ fn cargo_config_warning_commands_are_not_forwarded() {
     std::fs::write(&output_path, "").unwrap();
     std::fs::write(&summary_path, "").unwrap();
     let output = command(scratch.path())
-        .env("CHANGED_FILES", "member/src/lib.rs")
-        .env("EXCLUDED_MEMBERS", "unknown")
+        // Cargo only warns about this configuration when it reads it.
+        .env("TRUST_CARGO_CONFIG", "true")
+        .env("CHANGED_FILES_JSON", r#"["member/src/lib.rs"]"#)
+        .env("EXCLUDED_PACKAGES", "unknown")
         .env("GITHUB_OUTPUT", &output_path)
         .env("GITHUB_STEP_SUMMARY", &summary_path)
         .output()
@@ -356,12 +959,12 @@ fn cargo_config_warning_commands_are_not_forwarded() {
     assert!(output.status.success(), "{stderr}");
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
     assert!(
-        stderr.starts_with("::warning::excluded_members entries matched no workspace member:"),
+        stderr.starts_with("::warning::excluded_packages entries matched no workspace package:"),
         "{stderr}"
     );
     assert_eq!(
         output.stdout,
-        b"changed_crates=[\"member\"]\naffected_library_members=[\"member\"]\naffected_binary_members=[]\nforce_all=false\n"
+        b"changed_packages=[\"member\"]\naffected_libraries=[\"member\"]\naffected_binaries=[]\nforce_all=false\n"
     );
     assert_eq!(std::fs::read(output_path).unwrap(), output.stdout);
     assert!(
@@ -393,7 +996,7 @@ fn cargo_failure_diagnostic_commands_are_not_forwarded() {
     std::fs::write(&output_path, "sentinel\n").unwrap();
     std::fs::write(&summary_path, "sentinel\n").unwrap();
     let output = command(scratch.path())
-        .env("CHANGED_FILES", "member/src/lib.rs")
+        .env("CHANGED_FILES_JSON", r#"["member/src/lib.rs"]"#)
         .env("GITHUB_OUTPUT", &output_path)
         .env("GITHUB_STEP_SUMMARY", &summary_path)
         .output()
@@ -410,7 +1013,7 @@ fn cargo_failure_diagnostic_commands_are_not_forwarded() {
 fn missing_cargo_executable_is_a_handled_error() {
     let scratch = tempfile::tempdir().unwrap();
     let output = command(&fixture())
-        .env("CHANGED_FILES", "x")
+        .env("CHANGED_FILES_JSON", r#"["x"]"#)
         .env("CARGO", scratch.path().join("missing-cargo"))
         .output()
         .unwrap();
@@ -422,7 +1025,10 @@ fn missing_cargo_executable_is_a_handled_error() {
 fn lock_inspection_errors_do_not_enable_unlocked_resolution() {
     let scratch = workspace();
     std::os::unix::fs::symlink("Cargo.lock", scratch.path().join("Cargo.lock")).unwrap();
-    let output = run(scratch.path(), &[("CHANGED_FILES", "member/src/lib.rs")]);
+    let output = run(
+        scratch.path(),
+        &[("CHANGED_FILES_JSON", r#"["member/src/lib.rs"]"#)],
+    );
     assert_error(&output, "failed to inspect workspace Cargo.lock");
     assert!(!String::from_utf8_lossy(&output.stderr).contains("No Cargo.lock"));
 }
@@ -452,7 +1058,7 @@ fn malformed_metadata_and_failed_cargo_have_context() {
     ] {
         let executable = fake_cargo(&scratch, script);
         let output = command(&fixture())
-            .env("CHANGED_FILES", "x")
+            .env("CHANGED_FILES_JSON", r#"["x"]"#)
             .env("CARGO", executable)
             .env("FAKE_MANIFEST", fixture().join("Cargo.toml"))
             .output()
@@ -497,8 +1103,10 @@ cat "$FAKE_METADATA"
         }
         std::fs::write(&metadata_path, serde_json::to_vec(&json).unwrap()).unwrap();
         let output = command(&fixture())
-            .env("CHANGED_FILES", "lib-core/src/lib.rs")
+            .env("CHANGED_FILES_JSON", r#"["lib-core/src/lib.rs"]"#)
             .env("CARGO", &executable)
+            // The fake cargo accepts only the trusted command line.
+            .env("TRUST_CARGO_CONFIG", "true")
             .env("FAKE_MANIFEST", fixture().join("Cargo.toml"))
             .env("FAKE_METADATA", &metadata_path)
             .env("CARGO_TERM_COLOR", "always")
@@ -514,7 +1122,7 @@ cat "$FAKE_METADATA"
             );
             assert_eq!(output.stderr, Vec::<u8>::new());
             let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-            assert_eq!(json["changed_crates"], serde_json::json!(["lib-core"]));
+            assert_eq!(json["changed_packages"], serde_json::json!(["lib-core"]));
         } else {
             assert_error(&output, "workspace member 'missing-package-id' not found");
         }
@@ -535,7 +1143,7 @@ fn results_are_echoed_and_summary_is_appended_in_both_modes() {
             std::fs::write(&output_path, "existing=value\n").unwrap();
             std::fs::write(&summary_path, "existing summary\n").unwrap();
             let mut cmd = command(&fixture());
-            cmd.env("CHANGED_FILES", changed)
+            cmd.env("CHANGED_FILES_JSON", json(changed))
                 .env("FORCE_TRIGGERS", trigger)
                 .env("GITHUB_STEP_SUMMARY", &summary_path);
             if file_output {
@@ -564,9 +1172,9 @@ fn results_are_echoed_and_summary_is_appended_in_both_modes() {
                 "| **Changed** |",
                 "| **Affected libraries** |",
                 "| **Affected binaries** |",
-                "### Changed crates",
-                "### Affected library members",
-                "### Affected binary members",
+                "### Changed packages",
+                "### Affected libraries",
+                "### Affected binaries",
             ] {
                 assert!(summary.contains(text), "{summary}");
             }
@@ -602,9 +1210,9 @@ fn output_bytes_match_stage_three_in_both_modes() {
             // Keep unrelated Cargo processes from adding package-cache lock notices.
             // This fixture has only local dependencies, so an empty cache is sufficient.
             cmd.env("CARGO_HOME", scratch.path().join("cargo-home"));
-            cmd.env("CHANGED_FILES", changed)
+            cmd.env("CHANGED_FILES_JSON", json(changed))
                 .env("FORCE_TRIGGERS", trigger)
-                .env("EXCLUDED_MEMBERS", excluded)
+                .env("EXCLUDED_PACKAGES", excluded)
                 .env("GITHUB_STEP_SUMMARY", &summary_path);
             if file_output {
                 cmd.env("GITHUB_OUTPUT", &output_path);
@@ -646,7 +1254,7 @@ fn invalid_summary_does_not_publish_outputs() {
     let output_path = scratch.path().join("output");
     std::fs::write(&output_path, "sentinel\n").unwrap();
     let output = command(&fixture())
-        .env("CHANGED_FILES", "x")
+        .env("CHANGED_FILES_JSON", r#"["x"]"#)
         .env("GITHUB_OUTPUT", &output_path)
         .env("GITHUB_STEP_SUMMARY", scratch.path())
         .output()
@@ -664,7 +1272,7 @@ fn output_locations_can_be_non_utf8_paths() {
     let path = scratch.path().join(OsStr::from_bytes(b"output-\xff"));
     std::fs::write(&path, "").unwrap();
     let output = command(&fixture())
-        .env("CHANGED_FILES", "app-alpha/src/main.rs")
+        .env("CHANGED_FILES_JSON", r#"["app-alpha/src/main.rs"]"#)
         .env("GITHUB_OUTPUT", &path)
         .output()
         .unwrap();
@@ -677,7 +1285,7 @@ fn output_locations_can_be_non_utf8_paths() {
 fn real_output_write_failures_exit_one() {
     for destination in ["GITHUB_OUTPUT", "GITHUB_STEP_SUMMARY", "stdout"] {
         let mut cmd = command(&fixture());
-        cmd.env("CHANGED_FILES", "app-alpha/src/main.rs");
+        cmd.env("CHANGED_FILES_JSON", r#"["app-alpha/src/main.rs"]"#);
         if destination == "stdout" {
             cmd.stdout(
                 std::fs::OpenOptions::new()
@@ -711,9 +1319,11 @@ fn unavailable_sources_fail_without_publishing_partial_results() {
             let summary_path = scratch.path().join("summary");
             std::fs::write(&output_path, "sentinel\n").unwrap();
             std::fs::write(&summary_path, "sentinel\n").unwrap();
+            // An empty Cargo home, kept outside the checkout as isolation requires.
+            let home = tempfile::tempdir().unwrap();
             let output = command(scratch.path())
-                .env("CARGO_HOME", scratch.path().join("cargo-home"))
-                .env("CHANGED_FILES", changed)
+                .env("CARGO_HOME", home.path())
+                .env("CHANGED_FILES_JSON", json(changed))
                 .env("GITHUB_OUTPUT", &output_path)
                 .env("GITHUB_STEP_SUMMARY", &summary_path)
                 .output()
@@ -736,7 +1346,7 @@ fn malformed_lockfiles_fail_without_modification() {
             std::fs::write(&lock, b"not toml\xff").unwrap();
             let output = run(
                 &scratch.path().join(directory),
-                &[("CHANGED_FILES", changed)],
+                &[("CHANGED_FILES_JSON", &json(changed))],
             );
             assert_error(&output, "cargo metadata failed");
             assert_eq!(std::fs::read(lock).unwrap(), b"not toml\xff");
@@ -784,7 +1394,9 @@ fn git_source_patch_uses_cargos_selected_workspace_identity() {
     std::fs::write(scratch.path().join("app/src/main.rs"), "fn main() {}\n").unwrap();
     std::fs::write(scratch.path().join("app/Cargo.toml"), format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nrenamed = {{ package = \"member\", git = \"{url}\" }}\n")).unwrap();
     std::fs::write(scratch.path().join("Cargo.toml"), format!("[workspace]\nmembers = [\"member\", \"app\"]\nresolver = \"2\"\n[patch.\"{url}\"]\nmember = {{ path = \"member\" }}\n")).unwrap();
-    let cache = scratch.path().join("cargo-home");
+    // An empty Cargo home, kept outside the checkout as isolation requires.
+    let home = tempfile::tempdir().unwrap();
+    let cache = home.path().join("cargo-home");
     let metadata = Command::new(env!("CARGO"))
         .current_dir(scratch.path())
         .args(["metadata", "--format-version", "1", "--all-features"])
@@ -808,15 +1420,12 @@ fn git_source_patch_uses_cargos_selected_workspace_identity() {
     assert_eq!(node["deps"][0]["pkg"], member["id"]);
     let output = command(scratch.path())
         .env("CARGO_HOME", &cache)
-        .env("CHANGED_FILES", "member/src/lib.rs")
+        .env("CHANGED_FILES_JSON", r#"["member/src/lib.rs"]"#)
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(
-        result["affected_binary_members"],
-        serde_json::json!(["app"])
-    );
+    assert_eq!(result["affected_binaries"], serde_json::json!(["app"]));
 }
 
 #[cfg(unix)]
@@ -844,7 +1453,9 @@ fn locate_project_failures_are_reported_before_metadata() {
         for changed in ["", "lib-core/src/lib.rs"] {
             let output = command(&fixture())
                 .env("CARGO", &executable)
-                .env("CHANGED_FILES", changed)
+                // The fake cargo accepts only the trusted command line.
+                .env("TRUST_CARGO_CONFIG", "true")
+                .env("CHANGED_FILES_JSON", json(changed))
                 .output()
                 .unwrap();
             assert_error(&output, expected);
@@ -873,8 +1484,10 @@ esac
         .env("CARGO", executable)
         .env("EXPECTED_CWD", &cwd)
         .env("COMMAND_LOG", &log)
+        // Trusted, both commands run in the working directory itself.
+        .env("TRUST_CARGO_CONFIG", "true")
         .env("FAKE_MANIFEST", fixture().join("Cargo.toml"))
-        .env("CHANGED_FILES", "lib-core/src/lib.rs")
+        .env("CHANGED_FILES_JSON", r#"["lib-core/src/lib.rs"]"#)
         .output()
         .unwrap();
     assert_error(&output, "cargo metadata failed: error: locked failure");
@@ -915,7 +1528,7 @@ fn unresolved_metadata_fails_even_for_empty_input_and_force_all() {
             .env("CARGO", &executable)
             .env("FAKE_MANIFEST", fixture().join("Cargo.toml"))
             .env("FAKE_METADATA", &data)
-            .env("CHANGED_FILES", changed)
+            .env("CHANGED_FILES_JSON", json(changed))
             .env("FORCE_TRIGGERS", force)
             .env("GITHUB_OUTPUT", &output_file)
             .env("GITHUB_STEP_SUMMARY", &summary)
@@ -981,7 +1594,7 @@ fn invalid_metadata_annotations_are_escaped_and_outputs_remain_untouched() {
             .env("CARGO", &executable)
             .env("FAKE_MANIFEST", fixture().join("Cargo.toml"))
             .env("FAKE_METADATA", &data_path)
-            .env("CHANGED_FILES", "lib-core/src/lib.rs")
+            .env("CHANGED_FILES_JSON", r#"["lib-core/src/lib.rs"]"#)
             .env("GITHUB_OUTPUT", &output_file)
             .env("GITHUB_STEP_SUMMARY", &summary)
             .output()

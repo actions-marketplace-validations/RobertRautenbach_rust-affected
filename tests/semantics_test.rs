@@ -49,9 +49,9 @@ fn force_all_filters_external_packages_by_identity() {
         &[],
     );
     assert!(result.force_all);
-    assert_eq!(result.changed_crates, Vec::<String>::new());
-    assert_eq!(result.affected_library_members, ["consumer", "shared"]);
-    assert_eq!(result.affected_binary_members, Vec::<String>::new());
+    assert_eq!(result.changed_packages, Vec::<String>::new());
+    assert_eq!(result.affected_libraries, ["consumer", "shared"]);
+    assert_eq!(result.affected_binaries, Vec::<String>::new());
     assert_eq!(result.warnings, Vec::<rust_affected::Warning>::new());
 }
 
@@ -64,9 +64,9 @@ fn excluding_a_member_does_not_leak_an_external_namesake() {
         &["shared"],
     );
     assert!(result.force_all);
-    assert_eq!(result.changed_crates, Vec::<String>::new());
-    assert_eq!(result.affected_library_members, ["consumer"]);
-    assert_eq!(result.affected_binary_members, Vec::<String>::new());
+    assert_eq!(result.changed_packages, Vec::<String>::new());
+    assert_eq!(result.affected_libraries, ["consumer"]);
+    assert_eq!(result.affected_binaries, Vec::<String>::new());
     assert_eq!(result.warnings, Vec::<rust_affected::Warning>::new());
 }
 
@@ -83,9 +83,9 @@ fn default_result_is_empty_without_warnings_or_force() {
         AffectedResult {
             warnings: vec![],
             force_all: false,
-            changed_crates: vec![],
-            affected_library_members: vec![],
-            affected_binary_members: vec![],
+            changed_packages: vec![],
+            affected_libraries: vec![],
+            affected_binaries: vec![],
         }
     );
 }
@@ -102,9 +102,9 @@ fn serialized_result_has_only_the_four_output_fields() {
     assert_eq!(
         serde_json::to_value(&result).unwrap(),
         serde_json::json!({
-            "changed_crates": ["sub-lib"],
-            "affected_library_members": ["independent-lib", "sub-lib"],
-            "affected_binary_members": ["root-app"],
+            "changed_packages": ["sub-lib"],
+            "affected_libraries": ["independent-lib", "sub-lib"],
+            "affected_binaries": ["root-app"],
             "force_all": true,
         })
     );
@@ -140,9 +140,9 @@ fn compute(name: &str, files: &[&str], triggers: &[&str], excluded: &[&str]) -> 
 }
 
 fn assert_lists(result: &AffectedResult, changed: &[&str], libraries: &[&str], binaries: &[&str]) {
-    assert_eq!(result.changed_crates, changed);
-    assert_eq!(result.affected_library_members, libraries);
-    assert_eq!(result.affected_binary_members, binaries);
+    assert_eq!(result.changed_packages, changed);
+    assert_eq!(result.affected_libraries, libraries);
+    assert_eq!(result.affected_binaries, binaries);
     assert!(!result.force_all);
 }
 
@@ -337,7 +337,14 @@ fn exclusions_are_normalized_component_prefixes() {
 
 #[test]
 fn directory_force_triggers_match_the_directory_and_descendants_only() {
-    for trigger in ["infra/", "./infra/", "././infra/"] {
+    for trigger in [
+        "infra/",
+        "./infra/",
+        "././infra/",
+        "infra//",
+        ".//infra/",
+        "infra/./",
+    ] {
         for file in [
             "infra",
             "infra/",
@@ -347,8 +354,8 @@ fn directory_force_triggers_match_the_directory_and_descendants_only() {
         ] {
             let result = compute("workspace", &[file], &[trigger], &["app-alpha"]);
             assert!(result.force_all, "{file} with {trigger}");
-            assert_eq!(result.changed_crates, Vec::<String>::new());
-            assert_eq!(result.affected_binary_members, ["app-beta", "tool-alpha"]);
+            assert_eq!(result.changed_packages, Vec::<String>::new());
+            assert_eq!(result.affected_binaries, ["app-beta", "tool-alpha"]);
         }
         for file in [
             "infra-extra",
@@ -362,6 +369,125 @@ fn directory_force_triggers_match_the_directory_and_descendants_only() {
             );
         }
     }
+}
+
+#[test]
+fn force_triggers_that_can_never_match_are_rejected() {
+    for trigger in [
+        "",
+        ".",
+        "./",
+        "/",
+        "//",
+        "/Cargo.lock",
+        "/abs/infra/",
+        "..",
+        "../shared/",
+        "infra/../infra/",
+    ] {
+        for files in [vec![], vec!["infra/deploy.yml".to_string()]] {
+            let error = compute_affected(
+                graph("workspace"),
+                &files,
+                &[trigger.into()],
+                &HashSet::<String>::new(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&error, rust_affected::Error::UnmatchableForceTrigger(t) if t == trigger),
+                "{trigger:?}: {error}"
+            );
+            assert!(error.to_string().contains(&format!("{trigger:?}")));
+        }
+    }
+    // Separators inside a pattern are normalized, not rejected.
+    for trigger in ["lib-core//src/*.rs", "./lib-core/./src/**", "**//*.rs"] {
+        assert!(compute("workspace", &["lib-core/src/lib.rs"], &[trigger], &[]).force_all);
+    }
+}
+
+#[test]
+fn paths_are_literal_strings() {
+    let expected = compute("workspace", &["lib-core/src/lib.rs"], &[], &[]);
+    for file in [
+        "lib-core/src/my file.rs",
+        "lib-core/src/café.rs",
+        "lib-core/src/a\"b.rs",
+        "lib-core/src/a\\b.rs",
+        "lib-core/src/tab\there.rs",
+        "lib-core/ src/lib.rs",
+    ] {
+        assert_eq!(compute("workspace", &[file], &[], &[]), expected, "{file}");
+    }
+    assert!(
+        compute(
+            "workspace",
+            &["infra/my file.yml"],
+            &["infra/my file.yml"],
+            &[]
+        )
+        .force_all
+    );
+    // Quotes are part of the name: git's quoted form is a different path that
+    // nothing owns, and it is neither decoded nor reported.
+    for file in [
+        r#""lib-core/src/lib.rs""#,
+        r#""lib-core/src/caf\303\251.rs""#,
+        r#""lib-core/src/my"#,
+    ] {
+        let result = compute("workspace", &[file], &[], &[]);
+        assert_lists(&result, &[], &[], &[]);
+        assert_eq!(result.warnings, [], "{file}");
+    }
+}
+
+#[test]
+fn workspace_wide_files_warn_only_when_nothing_covers_them() {
+    use rust_affected::Warning::UncoveredRootFile;
+    let files = [
+        "rust-toolchain.toml",
+        "./Cargo.lock",
+        "Cargo.toml",
+        ".cargo/config.toml",
+        ".cargo/config",
+        "rust-toolchain",
+        "Cargo.lock",
+    ];
+    let result = compute("workspace", &files, &[], &[]);
+    assert_lists(&result, &[], &[], &[]);
+    assert_eq!(
+        result.warnings,
+        [
+            ".cargo/config",
+            ".cargo/config.toml",
+            "Cargo.lock",
+            "Cargo.toml",
+            "rust-toolchain",
+            "rust-toolchain.toml",
+        ]
+        .map(|file| UncoveredRootFile(file.into()))
+    );
+    // Any matching trigger selects everything, so nothing is left uncovered.
+    let forced = compute("workspace", &files, &["Cargo.lock"], &[]);
+    assert!(forced.force_all);
+    assert_eq!(forced.warnings, []);
+    // A trigger that does not match leaves the gap in place.
+    assert_eq!(
+        compute("workspace", &["Cargo.lock"], &["infra/"], &[]).warnings,
+        [UncoveredRootFile("Cargo.lock".into())]
+    );
+    // Other root files, and the same names inside a package, are ordinary files.
+    for file in ["README.md", "lib-core/Cargo.toml", "tools/Cargo.lock"] {
+        assert_eq!(
+            compute("workspace", &[file], &[], &[]).warnings,
+            [],
+            "{file}"
+        );
+    }
+    // A root package owns the root files, so they select it instead.
+    let owned = compute("root-package", &["Cargo.lock", "Cargo.toml"], &[], &[]);
+    assert_eq!(owned.changed_packages, ["root-app"]);
+    assert_eq!(owned.warnings, []);
 }
 
 #[test]
